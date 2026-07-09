@@ -56,21 +56,75 @@ echo "enable_kv_cache=${enable_kv_cache:-true}"
 echo "enable_text_kv_cache=${enable_text_kv_cache:-${enable_kv_cache:-true}}"
 echo "use_taylor_cache=${use_taylor_cache:-false}"
 echo "moe_impl=${moe_impl:-flashinfer}"
+echo "attn_impl=${attn_impl:-torch_sdpa}"
+HUNYUAN_CFG_MODE="${hunyuan_cfg_mode:-parallel}"
+CFG_PARALLEL_SIZE="${cfg_parallel_size:-2}"
+FLASHINFER_AUTOTUNE_MODE="${FLASHINFER_AUTOTUNE_MODE:-${flashinfer_autotune_mode:-tune}}"
+FLASHINFER_AUTOTUNE_CACHE="${FLASHINFER_AUTOTUNE_CACHE:-${flashinfer_autotune_cache:-${lightx2v_path}/save_results/hunyuan_image3_flashinfer_autotune_${DEMO}.json}}"
+echo "hunyuan_cfg_mode=${HUNYUAN_CFG_MODE}"
+echo "cfg_parallel_size=${CFG_PARALLEL_SIZE}"
+echo "flashinfer_autotune_mode=${FLASHINFER_AUTOTUNE_MODE}"
+echo "flashinfer_autotune_cache=${FLASHINFER_AUTOTUNE_CACHE}"
+TORCHRUN_LOG_DIR="${TORCHRUN_LOG_DIR:-${lightx2v_path}/save_results/torchrun_logs/hunyuan_image3_${DEMO}}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+echo "torchrun_log_dir=${TORCHRUN_LOG_DIR}"
 
 source "${lightx2v_path}/scripts/base/base.sh"
 
 config_json="${lightx2v_path}/configs/hunyuan_image3/hunyuan_image3_i2i.json"
+runtime_config="$config_json"
+launcher=(python)
+if [ "$HUNYUAN_CFG_MODE" = "parallel" ]; then
+    export LIGHTX2V_CFG_PARALLEL_DEVICE_SPLIT=1
+    export LIGHTX2V_CFG_PARALLEL_SIZE="$CFG_PARALLEL_SIZE"
+    runtime_config="$(mktemp /tmp/hunyuan_image3_ti2i_cfg_parallel.XXXXXX.json)"
+    trap 'rm -f "$runtime_config"' EXIT
+    python - "$config_json" "$runtime_config" "$CFG_PARALLEL_SIZE" <<'PY'
+import json
+import sys
 
-python -m lightx2v.infer \
+base_config, runtime_config, cfg_parallel_size = sys.argv[1:4]
+with open(base_config, "r") as f:
+    config = json.load(f)
+
+parallel = dict(config.get("parallel") or {})
+parallel["cfg_p_size"] = int(cfg_parallel_size)
+parallel.setdefault("seq_p_size", 1)
+parallel.setdefault("tensor_p_size", 1)
+config["parallel"] = parallel
+config["enable_cfg"] = True
+
+with open(runtime_config, "w") as f:
+    json.dump(config, f, ensure_ascii=False, indent=4)
+PY
+    echo "runtime_config=${runtime_config}"
+    launcher=(
+        torchrun
+        --standalone
+        --nnodes=1
+        --nproc_per_node="$CFG_PARALLEL_SIZE"
+        --log_dir="$TORCHRUN_LOG_DIR"
+        --tee=3
+    )
+fi
+
+"${launcher[@]}" -m lightx2v.infer \
     --model_cls hunyuan_image3 \
     --task i2i \
     --model_path "$model_path" \
-    --config_json "$config_json" \
+    --config_json "$runtime_config" \
     --prompt "$prompt" \
     --image_path "$image_path" \
     --save_result_path "$save_result_path" \
     --seed "$seed" \
-    --moe_impl "${moe_impl:-eager}" \
+    --moe_impl "${moe_impl:-flashinfer}" \
+    --hunyuan_cfg_mode "${HUNYUAN_CFG_MODE}" \
+    --attn_impl "${attn_impl:-torch_sdpa}" \
+    --flashinfer_autotune_mode "${FLASHINFER_AUTOTUNE_MODE}" \
+    --flashinfer_autotune_cache "${FLASHINFER_AUTOTUNE_CACHE}" \
+    --flashinfer_tune_max_num_tokens "${flashinfer_tune_max_num_tokens:-16384}" \
+    --flashinfer_tuning_buckets "${flashinfer_tuning_buckets:-128,256,512,1024,2048,4096,8192,12288,16384}" \
+    --flashinfer_autotune_round_up "${flashinfer_autotune_round_up:-true}" \
     --enable_kv_cache "${enable_kv_cache:-true}" \
     --enable_text_kv_cache "${enable_text_kv_cache:-${enable_kv_cache:-true}}" \
     --use_taylor_cache "${use_taylor_cache:-false}" \

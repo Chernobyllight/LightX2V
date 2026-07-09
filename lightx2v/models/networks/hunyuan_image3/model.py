@@ -2,6 +2,7 @@ import os
 import re
 
 import torch
+import torch.distributed as dist
 from loguru import logger
 from safetensors import safe_open
 
@@ -39,6 +40,26 @@ def resolve_pipeline_devices(config, fallback_device):
     if config.get("pipeline_parallel", False) and torch.cuda.is_available():
         device_count = torch.cuda.device_count()
         if device_count > 0:
+            if config.get("cfg_parallel", False):
+                parallel_config = config.get("parallel") or {}
+                cfg_p_size = int(parallel_config.get("cfg_p_size", 1) or 1)
+                if cfg_p_size > 1:
+                    if device_count % cfg_p_size != 0:
+                        raise ValueError(
+                            "HunyuanImage3 cfg_parallel pipeline device split requires the visible CUDA device count "
+                            f"({device_count}) to be divisible by cfg_p_size ({cfg_p_size}). "
+                            "Set hunyuan_image3_pipeline_devices/pipeline_parallel_devices explicitly if you need a custom layout."
+                        )
+                    if not dist.is_available() or not dist.is_initialized():
+                        raise RuntimeError("HunyuanImage3 cfg_parallel pipeline device split requires initialized torch.distributed.")
+                    cfg_p_group = config["device_mesh"].get_group(mesh_dim="cfg_p")
+                    cfg_p_rank = dist.get_rank(cfg_p_group)
+                    devices_per_cfg_rank = device_count // cfg_p_size
+                    start = cfg_p_rank * devices_per_cfg_rank
+                    stop = start + devices_per_cfg_rank
+                    devices = [f"cuda:{idx}" for idx in range(start, stop)]
+                    logger.info(f"HunyuanImage3 cfg_parallel pipeline devices for cfg_p_rank={cfg_p_rank}: {devices}")
+                    return devices
             return [f"cuda:{idx}" for idx in range(device_count)]
 
     return [_normalize_device_name(fallback_device)]

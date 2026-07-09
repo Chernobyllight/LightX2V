@@ -57,6 +57,14 @@ def set_args2config(args):
     }
     _hunyuan_image3_cli_native_keys = (
         "moe_impl",
+        "hunyuan_cfg_mode",
+        "attn_impl",
+        "flashinfer_autotune",
+        "flashinfer_autotune_mode",
+        "flashinfer_autotune_cache",
+        "flashinfer_tuning_buckets",
+        "flashinfer_autotune_round_up",
+        "flashinfer_tune_max_num_tokens",
     )
     config["_hunyuan_image3_cli_native_snapshot"] = {
         k: getattr(args, k, None) for k in _hunyuan_image3_cli_native_keys if hasattr(args, k) and getattr(args, k, None) is not None
@@ -269,6 +277,8 @@ def auto_calc_config(config):
         config.setdefault("moe_layer_num_skipped", 0)
         config.setdefault("use_mixed_mlp_moe", False)
         config.setdefault("moe_impl", "eager")
+        config.setdefault("attn_impl", "torch_sdpa")
+        config.setdefault("hunyuan_cfg_mode", "parallel")
         config.setdefault("pipeline_parallel", True)
         if "vae_scale_factor" not in config:
             vae_downsample_factor = config.get("vae_downsample_factor")
@@ -318,6 +328,23 @@ def set_config(args):
     return config
 
 
+def _parallel_warmup_device(config):
+    if (
+        os.environ.get("LIGHTX2V_CFG_PARALLEL_DEVICE_SPLIT", "").lower() in ("1", "true", "yes", "on")
+        and config.get("model_cls") == "hunyuan_image3"
+        and config.get("cfg_parallel", False)
+        and torch.cuda.is_available()
+    ):
+        parallel = config.get("parallel") or {}
+        cfg_p_size = int(parallel.get("cfg_p_size", 1) or 1)
+        device_count = torch.cuda.device_count()
+        if cfg_p_size > 1 and device_count >= cfg_p_size and device_count % cfg_p_size == 0:
+            cfg_p_group = config["device_mesh"].get_group(mesh_dim="cfg_p")
+            cfg_p_rank = dist.get_rank(cfg_p_group)
+            return f"{AI_DEVICE}:{cfg_p_rank * (device_count // cfg_p_size)}"
+    return f"{AI_DEVICE}:{dist.get_rank()}"
+
+
 def set_parallel_config(config):
     if config["parallel"]:
         tensor_p_size = config["parallel"].get("tensor_p_size", 1)
@@ -344,7 +371,7 @@ def set_parallel_config(config):
                 config["cfg_parallel"] = True
 
         # warmup dist
-        _a = torch.zeros([1]).to(f"{AI_DEVICE}:{dist.get_rank()}")
+        _a = torch.zeros([1]).to(_parallel_warmup_device(config))
         dist.all_reduce(_a)
 
 
