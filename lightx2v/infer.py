@@ -1,5 +1,10 @@
 import argparse
+import json
 import os
+import time
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -77,6 +82,49 @@ def distributed_barrier():
     return True
 
 
+def benchmark_synchronize():
+    """Wait for local device work and keep all benchmark ranks aligned."""
+    from lightx2v_platform.base.global_var import AI_DEVICE
+
+    device_module = getattr(torch, AI_DEVICE, None)
+    if device_module is not None and hasattr(device_module, "synchronize"):
+        device_module.synchronize()
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+
+    if AI_DEVICE == "cuda" and torch.cuda.is_available():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
+def is_output_rank():
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+
+def write_benchmark_result(args, elapsed_seconds):
+    if not args.benchmark_result_path or not is_output_rank():
+        return
+
+    result_path = Path(args.benchmark_result_path)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_cls": args.model_cls,
+        "task": args.task,
+        "warmup_iterations": args.benchmark_warmup_iters,
+        "elapsed_seconds": elapsed_seconds,
+        "timing_scope": "run_pipeline_including_result_save",
+        "world_size": dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1,
+        "seed": args.seed,
+        "config_json": args.config_json,
+        "save_result_path": args.save_result_path,
+        "measured_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    logger.info(f"[Benchmark] timing result saved to: {result_path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42, help="The seed for random generator")
@@ -148,6 +196,18 @@ def main():
     parser.add_argument("--config_json", type=str, required=True)
     parser.add_argument("--use_prompt_enhancer", action="store_true")
     parser.add_argument("--warmup", action="store_true", help="Warm up the model before inference. Disabled by default.")
+    parser.add_argument(
+        "--benchmark_warmup_iters",
+        type=int,
+        default=0,
+        help="Run full-pipeline warmup iterations before the measured inference. The warmup output is discarded.",
+    )
+    parser.add_argument(
+        "--benchmark_result_path",
+        type=str,
+        default=None,
+        help="Write the measured inference time as JSON on rank 0. Supplying this path enables benchmark timing.",
+    )
     parser.add_argument("--prompt", type=str, default="", help="The input prompt for text-to-video generation")
     parser.add_argument("--negative_prompt", type=str, default="")
 
@@ -293,6 +353,9 @@ def main():
     args = parser.parse_args()
     # validate_task_arguments(args)
 
+    if args.benchmark_warmup_iters < 0:
+        parser.error("--benchmark_warmup_iters must be greater than or equal to 0")
+
     seed_all(args.seed)
 
     # set config
@@ -316,7 +379,36 @@ def main():
         # start to infer
         data = args.__dict__
         update_input_info_from_dict(input_info, data)
-        runner.run_pipeline(input_info)
+
+        benchmark_enabled = args.benchmark_warmup_iters > 0 or bool(args.benchmark_result_path)
+        if benchmark_enabled:
+            warmup_input_info = replace(
+                input_info,
+                save_result_path=None,
+                return_result_tensor=False,
+            )
+            for warmup_index in range(args.benchmark_warmup_iters):
+                seed_all(args.seed)
+                benchmark_synchronize()
+                if is_output_rank():
+                    logger.info(f"[Benchmark] warmup {warmup_index + 1}/{args.benchmark_warmup_iters}, task={args.task}")
+                runner.run_pipeline(warmup_input_info)
+                benchmark_synchronize()
+
+            if is_output_rank():
+                logger.info(f"[Benchmark] measured inference started, task={args.task}")
+            seed_all(args.seed)
+            benchmark_synchronize()
+            benchmark_start = time.perf_counter()
+            runner.run_pipeline(input_info)
+            benchmark_synchronize()
+            elapsed_seconds = time.perf_counter() - benchmark_start
+
+            if is_output_rank():
+                logger.info(f"[Benchmark] task={args.task}, steady_state_e2e={elapsed_seconds:.6f} seconds")
+            write_benchmark_result(args, elapsed_seconds)
+        else:
+            runner.run_pipeline(input_info)
 
     # Clean up distributed process group
     if dist.is_initialized():
