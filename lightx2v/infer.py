@@ -1,5 +1,11 @@
 import argparse
+import json
 import os
+import statistics
+import time
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -78,6 +84,252 @@ def distributed_barrier():
 
     logger.info(f"[Barrier] synchronized all ranks")
     return True
+
+
+def benchmark_synchronize():
+    """Finish device work and align all ranks at a benchmark boundary."""
+    from lightx2v_platform.base.global_var import AI_DEVICE
+
+    device_module = getattr(torch, AI_DEVICE, None)
+    if device_module is not None and hasattr(device_module, "synchronize"):
+        device_module.synchronize()
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+
+    if AI_DEVICE == "cuda" and torch.cuda.is_available():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
+def _distributed_max_values(values):
+    values = [float(value) for value in values]
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return values
+
+    backend = str(dist.get_backend()).lower()
+    device = torch.device("cuda", torch.cuda.current_device()) if "nccl" in backend else torch.device("cpu")
+    length_bounds = torch.tensor([len(values), -len(values)], dtype=torch.int64, device=device)
+    dist.all_reduce(length_bounds, op=dist.ReduceOp.MAX)
+    maximum_length = int(length_bounds[0].item())
+    minimum_length = -int(length_bounds[1].item())
+    if minimum_length != maximum_length:
+        raise RuntimeError(f"Benchmark timing arrays differ across ranks: min={minimum_length}, max={maximum_length}.")
+    if maximum_length == 0:
+        return []
+
+    reduced = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(reduced, op=dist.ReduceOp.MAX)
+    return reduced.cpu().tolist()
+
+
+def aggregate_fine_grained_stage_timings(stage_timings):
+    """Aggregate per-rank CUDA-event timings after the measured E2E boundary."""
+    if not isinstance(stage_timings, dict):
+        return stage_timings
+
+    aggregated = dict(stage_timings)
+    if "ar_prefill_seconds" in aggregated:
+        aggregated["ar_prefill_seconds"] = _distributed_max_values([aggregated["ar_prefill_seconds"]])[0]
+
+    decode_token_seconds = aggregated.get("ar_decode_token_seconds")
+    if isinstance(decode_token_seconds, list):
+        decode_token_seconds = _distributed_max_values(decode_token_seconds)
+        decode_seconds = sum(decode_token_seconds)
+        decode_token_count = len(decode_token_seconds)
+        ar_timing_scope = str(aggregated.get("ar_fine_grained_timing_scope", "fine_grained_local_rank"))
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            ar_timing_scope = ar_timing_scope.replace("local_rank", "max_across_world_after_e2e")
+        aggregated.update(
+            {
+                "ar_fine_grained_timing_scope": ar_timing_scope,
+                "ar_decode_token_seconds": decode_token_seconds,
+                "ar_decode_seconds": decode_seconds,
+                "ar_decode_model_token_count": decode_token_count,
+            }
+        )
+        if decode_token_count:
+            seconds_per_token = decode_seconds / decode_token_count
+            aggregated["ar_decode_seconds_per_token"] = seconds_per_token
+            aggregated["ar_decode_milliseconds_per_token"] = seconds_per_token * 1000.0
+
+    denoise_step_seconds = aggregated.get("denoise_step_seconds_samples")
+    if isinstance(denoise_step_seconds, list):
+        denoise_step_seconds = _distributed_max_values(denoise_step_seconds)
+        step_count = len(denoise_step_seconds)
+        denoise_timing_scope = str(aggregated.get("denoise_fine_grained_timing_scope", "fine_grained_local_rank"))
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            denoise_timing_scope = denoise_timing_scope.replace("local_rank", "max_across_world_after_e2e")
+        aggregated.update(
+            {
+                "denoise_fine_grained_timing_scope": denoise_timing_scope,
+                "denoise_step_seconds_samples": denoise_step_seconds,
+                "denoise_step_count": step_count,
+            }
+        )
+        if step_count:
+            aggregated["denoise_step_seconds"] = sum(denoise_step_seconds) / step_count
+            aggregated["denoise_first_step_seconds"] = denoise_step_seconds[0]
+            aggregated["denoise_remaining_step_seconds"] = sum(denoise_step_seconds[1:]) / (step_count - 1) if step_count > 1 else denoise_step_seconds[0]
+    return aggregated
+
+
+def is_output_rank():
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+
+def _summarize_benchmark_samples(samples):
+    values = [float(value) for value in samples]
+    return {
+        "count": len(values),
+        "mean": statistics.fmean(values),
+        "median": statistics.median(values),
+        "min": min(values),
+        "max": max(values),
+        "population_stddev": statistics.pstdev(values),
+    }
+
+
+def _is_stage_summary_metric(key, values):
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+        return False
+    return key.endswith(("_seconds", "_seconds_per_token", "_milliseconds_per_token", "_count"))
+
+
+def _summarize_stage_samples(stage_timing_samples):
+    if not stage_timing_samples:
+        return {}
+    summary = {}
+    common_keys = set.intersection(*(set(sample) for sample in stage_timing_samples))
+    for key in sorted(common_keys):
+        values = [sample[key] for sample in stage_timing_samples]
+        if _is_stage_summary_metric(key, values):
+            summary[key] = _summarize_benchmark_samples(values)
+    return summary
+
+
+def _summarize_ar_tokens(stage_timing_samples):
+    valid_samples = [
+        sample
+        for sample in stage_timing_samples
+        if isinstance(sample.get("ar_seconds"), (int, float)) and isinstance(sample.get("generated_token_count"), (int, float)) and sample["generated_token_count"] > 0
+    ]
+    if not valid_samples:
+        return None
+
+    total_ar_seconds = sum(float(sample["ar_seconds"]) for sample in valid_samples)
+    total_generated_tokens = sum(int(sample["generated_token_count"]) for sample in valid_samples)
+    seconds_per_token = total_ar_seconds / total_generated_tokens
+    return {
+        "sample_count": len(valid_samples),
+        "total_generated_tokens": total_generated_tokens,
+        "total_ar_seconds": total_ar_seconds,
+        "average_seconds_per_token": seconds_per_token,
+        "average_milliseconds_per_token": seconds_per_token * 1000.0,
+    }
+
+
+def _summarize_ar_decode_tokens(stage_timing_samples):
+    valid_samples = [
+        sample
+        for sample in stage_timing_samples
+        if isinstance(sample.get("ar_decode_seconds"), (int, float)) and isinstance(sample.get("ar_decode_model_token_count"), (int, float)) and sample["ar_decode_model_token_count"] > 0
+    ]
+    if not valid_samples:
+        return None
+
+    total_decode_seconds = sum(float(sample["ar_decode_seconds"]) for sample in valid_samples)
+    total_decode_tokens = sum(int(sample["ar_decode_model_token_count"]) for sample in valid_samples)
+    seconds_per_token = total_decode_seconds / total_decode_tokens
+    return {
+        "sample_count": len(valid_samples),
+        "total_decode_model_tokens": total_decode_tokens,
+        "total_decode_seconds": total_decode_seconds,
+        "average_seconds_per_token": seconds_per_token,
+        "average_milliseconds_per_token": seconds_per_token * 1000.0,
+    }
+
+
+def _summarize_denoise_steps(stage_timing_samples):
+    valid_samples = [
+        sample["denoise_step_seconds_samples"] for sample in stage_timing_samples if isinstance(sample.get("denoise_step_seconds_samples"), list) and sample["denoise_step_seconds_samples"]
+    ]
+    if not valid_samples:
+        return None
+
+    all_step_seconds = [float(value) for sample in valid_samples for value in sample]
+    summary = _summarize_benchmark_samples(all_step_seconds)
+    return {
+        "sample_count": len(valid_samples),
+        "total_step_count": len(all_step_seconds),
+        "average_seconds_per_step": summary["mean"],
+        "average_milliseconds_per_step": summary["mean"] * 1000.0,
+        "step_seconds_summary": summary,
+    }
+
+
+def write_benchmark_result(
+    args,
+    elapsed_seconds_samples,
+    runner=None,
+    stage_timing_samples=None,
+    runner_initialization_seconds=None,
+    warmup_elapsed_seconds=None,
+):
+    if not args.benchmark_result_path or not is_output_rank():
+        return
+
+    stage_timing_samples = stage_timing_samples or []
+    elapsed_summary = _summarize_benchmark_samples(elapsed_seconds_samples)
+    result_path = Path(args.benchmark_result_path)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_cls": args.model_cls,
+        "task": args.task,
+        "warmup_iterations": args.benchmark_warmup_iters,
+        "measure_iterations": len(elapsed_seconds_samples),
+        "elapsed_seconds": elapsed_summary["mean"],
+        "elapsed_seconds_samples": elapsed_seconds_samples,
+        "elapsed_seconds_summary": elapsed_summary,
+        "timing_scope": "steady_state_run_pipeline_including_result_save_world_max",
+        "runner_initialization_included": False,
+        "world_size": dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1,
+        "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
+        "seed": args.seed,
+        "config_json": args.config_json,
+        "save_result_path": args.save_result_path,
+        "measured_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    if runner_initialization_seconds is not None:
+        payload["runner_initialization_seconds"] = runner_initialization_seconds
+    if warmup_elapsed_seconds is not None:
+        payload["warmup_elapsed_seconds"] = warmup_elapsed_seconds
+    stage_timings = getattr(runner, "last_stage_timings", None)
+    if isinstance(stage_timings, dict):
+        payload["stage_timings"] = stage_timings
+    if stage_timing_samples:
+        payload["stage_timing_samples"] = stage_timing_samples
+        payload["stage_timings_summary"] = _summarize_stage_samples(stage_timing_samples)
+        if any("ar_prefill_seconds" in sample or "denoise_step_seconds_samples" in sample for sample in stage_timing_samples):
+            payload["fine_grained_metric_definitions"] = {
+                "ar_prefill_seconds": "First model-backed AR iteration: full prompt/KV fill through first sampled-token broadcast; CUDA-event critical path, max across ranks.",
+                "ar_decode_milliseconds_per_token": "Mean of later model-backed AR iterations; forced transition tokens that do not invoke the model are excluded; CUDA-event critical path, max across ranks.",
+                "denoise_step_seconds": "Mean complete scheduler iteration, including both conditional and unconditional forwards under serial CFG, prediction broadcast, and latent update; CUDA-event critical path, max across ranks.",
+                "elapsed_seconds": "Full run_pipeline wall time including VAE decode and result save, excluding runner/weight initialization; max across ranks.",
+            }
+        ar_token_summary = _summarize_ar_tokens(stage_timing_samples)
+        if ar_token_summary is not None:
+            payload["ar_token_summary"] = ar_token_summary
+        ar_decode_token_summary = _summarize_ar_decode_tokens(stage_timing_samples)
+        if ar_decode_token_summary is not None:
+            payload["ar_decode_token_summary"] = ar_decode_token_summary
+        denoise_step_summary = _summarize_denoise_steps(stage_timing_samples)
+        if denoise_step_summary is not None:
+            payload["denoise_step_summary"] = denoise_step_summary
+
+    result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    logger.info(f"[Benchmark] timing result saved to: {result_path}")
 
 
 def main():
@@ -185,6 +437,24 @@ def main():
     parser.add_argument("--config_json", type=str, required=True)
     parser.add_argument("--use_prompt_enhancer", action="store_true")
     parser.add_argument("--warmup", action="store_true", help="Warm up the model before inference. Disabled by default.")
+    parser.add_argument(
+        "--benchmark_warmup_iters",
+        type=int,
+        default=0,
+        help="Run this many unmeasured full-pipeline iterations after runner/weight initialization.",
+    )
+    parser.add_argument(
+        "--benchmark_measure_iters",
+        type=int,
+        default=1,
+        help="Number of synchronized steady-state inference iterations to measure after warmup.",
+    )
+    parser.add_argument(
+        "--benchmark_result_path",
+        type=str,
+        default=None,
+        help="Write rank-0 benchmark samples and summaries to this JSON file.",
+    )
     parser.add_argument("--prompt", type=str, default="", help="The input prompt for text-to-video generation")
     parser.add_argument("--negative_prompt", type=str, default="")
     parser.add_argument(
@@ -327,10 +597,19 @@ def main():
     parser.add_argument("--mux_audio_video_path", type=str, default=None, help="(v2av, optional) After saving, mux audio from this file into the output mp4 (ffmpeg). ")
 
     args = parser.parse_args()
+    if args.benchmark_warmup_iters < 0:
+        parser.error("--benchmark_warmup_iters must be greater than or equal to 0")
+    if args.benchmark_measure_iters < 1:
+        parser.error("--benchmark_measure_iters must be greater than or equal to 1")
+
+    benchmark_enabled = bool(args.benchmark_result_path) or args.benchmark_warmup_iters > 0 or args.benchmark_measure_iters != 1
     seed_all(args.seed)
 
     # set config
     config = set_config(args)
+    stage_timing_env = os.getenv("LIGHTX2V_HUNYUAN_BENCHMARK_STAGE_TIMING", "").strip().lower()
+    if args.model_cls == "hunyuan_image3" and (benchmark_enabled or stage_timing_env in {"1", "true", "yes", "on"}):
+        config["benchmark_stage_timing"] = True
     config["warmup"] = args.warmup
     # init input_info
     input_info = init_empty_input_info(args.task, args.support_tasks)
@@ -346,11 +625,124 @@ def main():
 
     with ProfilingContext4DebugL1("Total Cost"):
         # init runner
+        runner_initialization_seconds = None
+        if benchmark_enabled:
+            benchmark_synchronize()
+            runner_initialization_start = time.perf_counter()
         runner = init_runner(config)
+        if benchmark_enabled:
+            benchmark_synchronize()
+            runner_initialization_seconds = time.perf_counter() - runner_initialization_start
+            if is_output_rank():
+                logger.info(f"[Benchmark] runner/weight initialization completed in {runner_initialization_seconds:.6f} seconds; this time is excluded from measured inference samples")
         # start to infer
         data = args.__dict__
         update_input_info_from_dict(input_info, data)
-        runner.run_pipeline(input_info)
+
+        if benchmark_enabled:
+            warmup_input_info = replace(input_info, save_result_path=None, return_result_tensor=False)
+            benchmark_synchronize()
+            warmup_start = time.perf_counter()
+            for warmup_index in range(args.benchmark_warmup_iters):
+                seed_all(args.seed)
+                benchmark_synchronize()
+                if is_output_rank():
+                    logger.info(f"[Benchmark] warmup {warmup_index + 1}/{args.benchmark_warmup_iters}, task={args.task}")
+                runner.run_pipeline(warmup_input_info)
+                benchmark_synchronize()
+            warmup_elapsed_seconds = time.perf_counter() - warmup_start
+
+            elapsed_seconds_samples = []
+            stage_timing_samples = []
+            for measure_index in range(args.benchmark_measure_iters):
+                if is_output_rank():
+                    logger.info(f"[Benchmark] measured inference {measure_index + 1}/{args.benchmark_measure_iters} started, task={args.task}")
+                seed_all(args.seed)
+                benchmark_synchronize()
+                benchmark_start = time.perf_counter()
+                runner.run_pipeline(input_info)
+                benchmark_synchronize()
+                local_elapsed_seconds = time.perf_counter() - benchmark_start
+                sample_elapsed_seconds = _distributed_max_values([local_elapsed_seconds])[0]
+                elapsed_seconds_samples.append(sample_elapsed_seconds)
+
+                stage_timings = getattr(runner, "last_stage_timings", None)
+                stage_timings = aggregate_fine_grained_stage_timings(stage_timings)
+                if isinstance(stage_timings, dict):
+                    runner.last_stage_timings = stage_timings
+                if isinstance(stage_timings, dict):
+                    stage_timing_samples.append(dict(stage_timings))
+
+                if is_output_rank():
+                    sample_message = f"[Benchmark] task={args.task}, sample={measure_index + 1}/{args.benchmark_measure_iters}, steady_state_e2e={sample_elapsed_seconds:.6f}s"
+                    if isinstance(stage_timings, dict):
+                        if "ar_seconds" in stage_timings:
+                            sample_message += f", ar={stage_timings['ar_seconds']:.6f}s"
+                        if "denoise_seconds" in stage_timings:
+                            sample_message += f", denoise={stage_timings['denoise_seconds']:.6f}s"
+                        if "ar_plus_denoise_seconds" in stage_timings:
+                            sample_message += f", ar+denoise={stage_timings['ar_plus_denoise_seconds']:.6f}s"
+                        if "ar_milliseconds_per_token" in stage_timings:
+                            sample_message += f", ar_per_token={stage_timings['ar_milliseconds_per_token']:.6f}ms"
+                        if "ar_prefill_seconds" in stage_timings:
+                            sample_message += f", ar_prefill={stage_timings['ar_prefill_seconds']:.6f}s"
+                        if "ar_decode_milliseconds_per_token" in stage_timings:
+                            sample_message += f", ar_decode={stage_timings['ar_decode_milliseconds_per_token']:.6f}ms/token"
+                        if "denoise_step_seconds" in stage_timings:
+                            sample_message += f", denoise_step={stage_timings['denoise_step_seconds'] * 1000.0:.6f}ms"
+                    logger.info(sample_message)
+
+            elapsed_summary = _summarize_benchmark_samples(elapsed_seconds_samples)
+            stage_summary = _summarize_stage_samples(stage_timing_samples)
+            ar_token_summary = _summarize_ar_tokens(stage_timing_samples)
+            ar_decode_token_summary = _summarize_ar_decode_tokens(stage_timing_samples)
+            denoise_step_summary = _summarize_denoise_steps(stage_timing_samples)
+            if is_output_rank():
+                logger.info(
+                    f"[Benchmark] aggregate steady_state_e2e: mean={elapsed_summary['mean']:.6f}s, "
+                    f"median={elapsed_summary['median']:.6f}s, min={elapsed_summary['min']:.6f}s, "
+                    f"max={elapsed_summary['max']:.6f}s"
+                )
+                for key, label in (
+                    ("ar_seconds", "AR"),
+                    ("denoise_seconds", "denoise"),
+                    ("ar_plus_denoise_seconds", "AR+denoise"),
+                    ("pipeline_before_result_save_seconds", "pipeline_before_result_save"),
+                ):
+                    if key in stage_summary:
+                        logger.info(f"[Benchmark] aggregate {label}: mean={stage_summary[key]['mean']:.6f}s")
+                if ar_token_summary is not None:
+                    logger.info(
+                        "[Benchmark] aggregate AR per generated token: "
+                        f"{ar_token_summary['average_milliseconds_per_token']:.6f}ms/token "
+                        f"({ar_token_summary['total_generated_tokens']} tokens across "
+                        f"{ar_token_summary['sample_count']} samples)"
+                    )
+                if ar_decode_token_summary is not None:
+                    logger.info(
+                        "[Benchmark] aggregate AR decode: "
+                        f"{ar_decode_token_summary['average_milliseconds_per_token']:.6f}ms/model-token "
+                        f"({ar_decode_token_summary['total_decode_model_tokens']} tokens across "
+                        f"{ar_decode_token_summary['sample_count']} samples)"
+                    )
+                if denoise_step_summary is not None:
+                    logger.info(
+                        "[Benchmark] aggregate denoise step: "
+                        f"{denoise_step_summary['average_milliseconds_per_step']:.6f}ms/step "
+                        f"({denoise_step_summary['total_step_count']} steps across "
+                        f"{denoise_step_summary['sample_count']} samples)"
+                    )
+
+            write_benchmark_result(
+                args,
+                elapsed_seconds_samples,
+                runner=runner,
+                stage_timing_samples=stage_timing_samples,
+                runner_initialization_seconds=runner_initialization_seconds,
+                warmup_elapsed_seconds=warmup_elapsed_seconds,
+            )
+        else:
+            runner.run_pipeline(input_info)
 
     # Clean up distributed process group
     if dist.is_initialized():

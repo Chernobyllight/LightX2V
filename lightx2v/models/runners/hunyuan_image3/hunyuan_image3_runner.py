@@ -1,6 +1,8 @@
+import hashlib
 import importlib
 import os
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
@@ -517,6 +519,33 @@ class HunyuanImage3Runner(DefaultRunner):
     def _is_output_rank(self):
         return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
+    def _benchmark_stage_timing_enabled(self):
+        return bool(self.config.get("benchmark_stage_timing", False))
+
+    def _benchmark_stage_timestamp(self):
+        if not self._benchmark_stage_timing_enabled():
+            return None
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _benchmark_ar_fields(self, ar_seconds):
+        fields = {
+            "ar_seconds": ar_seconds,
+            **getattr(self, "_last_ar_token_metadata", {}),
+        }
+        token_count = fields.get("generated_token_count", 0)
+        if token_count:
+            fields["ar_seconds_per_token"] = ar_seconds / token_count
+            fields["ar_milliseconds_per_token"] = fields["ar_seconds_per_token"] * 1000.0
+        return fields
+
+    def _benchmark_finish_cuda_events(self, event_pairs, device):
+        if not event_pairs:
+            return []
+        torch.cuda.synchronize(device)
+        return [start.elapsed_time(end) / 1000.0 for start, end in event_pairs]
+
     def _broadcast_parallel_tensor(self, tensor):
         group = self._parallel_control_group()
         if group is None:
@@ -961,6 +990,13 @@ class HunyuanImage3Runner(DefaultRunner):
         use_kv_cache = self._hunyuan_text_kv_cache_enabled()
         kv_cache = None
         cache_filled_length = 0
+        benchmark_timing = self._benchmark_stage_timing_enabled()
+        use_cuda_events = benchmark_timing and device.type == "cuda" and torch.cuda.is_available()
+        model_step_records = []
+        decode_input_token_counts = []
+        prefill_input_token_count = 0
+        forced_transition_token_count = 0
+        model_step_count = 0
         if use_kv_cache:
             kv_cache = HunyuanImage3StaticKVCache(
                 num_layers=self._hunyuan_num_layers(),
@@ -970,9 +1006,19 @@ class HunyuanImage3Runner(DefaultRunner):
 
         for _ in range(max_new_tokens):
             if pending_tokens:
+                forced_transition_token_count += 1
                 next_token_id = pending_tokens.pop(0)
                 next_token = torch.tensor([next_token_id], device=device, dtype=input_ids.dtype)
+                next_token = self._broadcast_parallel_tensor(next_token)
+                next_token_id = int(next_token.item())
             else:
+                model_step_kind = "prefill" if model_step_count == 0 else "decode"
+                if use_cuda_events:
+                    step_start = torch.cuda.Event(enable_timing=True)
+                    step_end = torch.cuda.Event(enable_timing=True)
+                    step_start.record()
+                elif benchmark_timing:
+                    step_start = time.perf_counter()
                 if use_kv_cache:
                     model_input_ids = input_ids[:, cache_filled_length:]
                     position_ids = torch.arange(cache_filled_length, input_ids.shape[1], dtype=torch.long, device=device)[None].expand(input_ids.shape[0], -1)
@@ -989,6 +1035,7 @@ class HunyuanImage3Runner(DefaultRunner):
                     )
                     cache_filled_length = input_ids.shape[1]
                 else:
+                    model_input_ids = input_ids
                     if cond_inputs is None:
                         model_inputs = self._build_text_model_inputs(input_ids, tokenizer_output, rope_image_info=rope_image_info)
                     else:
@@ -997,8 +1044,20 @@ class HunyuanImage3Runner(DefaultRunner):
                     logits = self.model.infer(model_inputs)["logits"][:, -1, :]
                 next_token = self._sample_text_token(logits, generator, generation_options=generation_options)
                 next_token = next_token.to(device=device, dtype=input_ids.dtype)
-            next_token = self._broadcast_parallel_tensor(next_token)
-            next_token_id = int(next_token.item())
+                next_token = self._broadcast_parallel_tensor(next_token)
+                next_token_id = int(next_token.item())
+                if benchmark_timing:
+                    if use_cuda_events:
+                        step_end.record()
+                        model_step_records.append((step_start, step_end))
+                    else:
+                        model_step_records.append(time.perf_counter() - step_start)
+                    input_token_count = int(model_input_ids.shape[1])
+                    if model_step_kind == "prefill":
+                        prefill_input_token_count = input_token_count
+                    else:
+                        decode_input_token_counts.append(input_token_count)
+                model_step_count += 1
 
             generated.append(next_token_id)
             if stream_output:
@@ -1015,6 +1074,36 @@ class HunyuanImage3Runner(DefaultRunner):
                 continue
             if next_token_id in plan.final_stop_tokens and not pending_tokens:
                 break
+
+        if benchmark_timing:
+            if use_cuda_events:
+                model_step_seconds = self._benchmark_finish_cuda_events(model_step_records, device)
+                timing_scope = "cuda_event_elapsed_local_rank"
+            else:
+                model_step_seconds = list(model_step_records)
+                timing_scope = "host_perf_counter_local_rank"
+
+            prefill_seconds = model_step_seconds[0] if model_step_seconds else 0.0
+            decode_token_seconds = model_step_seconds[1:]
+            decode_seconds = sum(decode_token_seconds)
+            decode_model_token_count = len(decode_token_seconds)
+            token_metadata = {
+                "ar_fine_grained_timing_scope": timing_scope,
+                "ar_prefill_seconds": prefill_seconds,
+                "ar_prefill_input_token_count": prefill_input_token_count,
+                "ar_decode_seconds": decode_seconds,
+                "ar_decode_model_token_count": decode_model_token_count,
+                "ar_forced_transition_token_count": forced_transition_token_count,
+                "ar_decode_token_seconds": decode_token_seconds,
+                "ar_decode_input_token_counts": decode_input_token_counts,
+            }
+            if decode_model_token_count:
+                decode_seconds_per_token = decode_seconds / decode_model_token_count
+                token_metadata["ar_decode_seconds_per_token"] = decode_seconds_per_token
+                token_metadata["ar_decode_milliseconds_per_token"] = decode_seconds_per_token * 1000.0
+            ar_token_metadata = getattr(self, "_last_ar_token_metadata", {})
+            ar_token_metadata.update(token_metadata)
+            self._last_ar_token_metadata = ar_token_metadata
 
         return generated
 
@@ -1105,6 +1194,8 @@ class HunyuanImage3Runner(DefaultRunner):
 
     def _generate_cot_text(self, prompt, image_size, batch_cond_images=None, cond_inputs=None):
         self._activate_parallel_phase("ar")
+        if self._benchmark_stage_timing_enabled():
+            self._last_ar_token_metadata = {"generated_token_count": 0}
         bot_task = self._resolve_bot_task()
         if bot_task == "image":
             return None
@@ -1134,6 +1225,15 @@ class HunyuanImage3Runner(DefaultRunner):
                 cond_inputs=prepared.get("cond_inputs"),
                 rope_image_info=prepared.get("rope_image_info"),
             )
+        if self._benchmark_stage_timing_enabled():
+            token_fingerprint = hashlib.sha256(",".join(str(token) for token in generated_tokens).encode("ascii")).hexdigest()[:16]
+            self._last_ar_token_metadata = {
+                **getattr(self, "_last_ar_token_metadata", {}),
+                "generated_token_count": len(generated_tokens),
+                "generated_token_sha256_16": token_fingerprint,
+            }
+            if self._is_output_rank():
+                logger.info(f"HunyuanImage3 benchmark AR tokens: count={len(generated_tokens)}, sha256_16={token_fingerprint}")
         if stream_output:
             self._print_text_generation_chunk("\n")
         cot_text = self._decode_cot_text(generated_tokens, plan)
@@ -1352,6 +1452,8 @@ class HunyuanImage3Runner(DefaultRunner):
 
     def _denoise_latents(self, prepared_inputs, image_size):
         self._activate_parallel_phase("denoise")
+        benchmark_timing = self._benchmark_stage_timing_enabled()
+        self._last_denoise_step_metadata = {}
         cfg_mode = self._resolve_denoise_cfg_mode(prepared_inputs)
         serial_branch_inputs = None
         if cfg_mode == "parallel":
@@ -1390,9 +1492,17 @@ class HunyuanImage3Runner(DefaultRunner):
             dynamic_ncols=True,
             disable=bool(self.config.get("disable_progress_bar", False)) or not self._is_output_rank(),
         )
+        use_cuda_events = benchmark_timing and latents.device.type == "cuda" and torch.cuda.is_available()
+        denoise_step_records = []
         autotune_controller = self._build_flashinfer_autotune_controller()
         with autotune_controller.context():
             for step_index, timestep in enumerate(denoise_steps):
+                if use_cuda_events:
+                    step_start = torch.cuda.Event(enable_timing=True)
+                    step_end = torch.cuda.Event(enable_timing=True)
+                    step_start.record()
+                elif benchmark_timing:
+                    step_start = time.perf_counter()
                 # ==================== CFG serial Processing ====================
                 if cfg_mode == "serial":
                     cond_model_inputs = self._build_denoise_model_inputs(
@@ -1502,8 +1612,31 @@ class HunyuanImage3Runner(DefaultRunner):
                 sigma = self.scheduler.sigmas[step_index].to(latents.device)
                 sigma_next = self.scheduler.sigmas[step_index + 1].to(latents.device)
                 latents = latents.float() + prediction.float() * (sigma_next - sigma)
+                if benchmark_timing:
+                    if use_cuda_events:
+                        step_end.record()
+                        denoise_step_records.append((step_start, step_end))
+                    else:
+                        denoise_step_records.append(time.perf_counter() - step_start)
 
         self._parallel_barrier()
+        if benchmark_timing:
+            if use_cuda_events:
+                denoise_step_seconds = self._benchmark_finish_cuda_events(denoise_step_records, latents.device)
+                timing_scope = "cuda_event_elapsed_local_rank"
+            else:
+                denoise_step_seconds = list(denoise_step_records)
+                timing_scope = "host_perf_counter_local_rank"
+            step_count = len(denoise_step_seconds)
+            if step_count:
+                self._last_denoise_step_metadata = {
+                    "denoise_fine_grained_timing_scope": timing_scope,
+                    "denoise_step_count": step_count,
+                    "denoise_step_seconds": sum(denoise_step_seconds) / step_count,
+                    "denoise_first_step_seconds": denoise_step_seconds[0],
+                    "denoise_remaining_step_seconds": (sum(denoise_step_seconds[1:]) / (step_count - 1) if step_count > 1 else denoise_step_seconds[0]),
+                    "denoise_step_seconds_samples": denoise_step_seconds,
+                }
         if hasattr(self.model, "transformer_infer") and hasattr(self.model.transformer_infer, "print_moe_profile"):
             self.model.transformer_infer.print_moe_profile(reset=True)
 
@@ -1553,24 +1686,51 @@ class HunyuanImage3Runner(DefaultRunner):
     @torch.no_grad()
     def generate_t2i(self, input_info):
         self._ensure_pipeline_modules()
+        pipeline_start = self._benchmark_stage_timestamp()
+        if pipeline_start is not None:
+            self.last_stage_timings = {}
         prompt = getattr(input_info, "prompt_enhanced", None) or getattr(input_info, "prompt", "")
         image_size = self._resolve_image_size(input_info)
         seed = getattr(input_info, "seed", None) or self.config.get("seed", 42)
+        ar_start = self._benchmark_stage_timestamp()
         cot_text = self._generate_cot_text(prompt, image_size)
+        ar_end = self._benchmark_stage_timestamp()
         prepared_inputs = self._prepare_text_to_image_inputs(
             prompt,
             image_size,
             seed,
             cot_text=cot_text,
         )
+        conditioning_end = self._benchmark_stage_timestamp()
         latents = self._denoise_latents(prepared_inputs, image_size)
+        denoise_end = self._benchmark_stage_timestamp()
+        if pipeline_start is not None:
+            ar_seconds = ar_end - ar_start
+            denoise_seconds = denoise_end - conditioning_end
+            self.last_stage_timings = {
+                "pipeline_setup_seconds": ar_start - pipeline_start,
+                **self._benchmark_ar_fields(ar_seconds),
+                "conditioning_prepare_seconds": conditioning_end - ar_end,
+                "denoise_seconds": denoise_seconds,
+                **getattr(self, "_last_denoise_step_metadata", {}),
+                "ar_plus_denoise_seconds": ar_seconds + denoise_seconds,
+                "ar_conditioning_denoise_seconds": denoise_end - ar_start,
+            }
         if not self._is_output_rank():
             return []
-        return self._decode_latents(latents, prepared_inputs["generator"])
+        images = self._decode_latents(latents, prepared_inputs["generator"])
+        decode_end = self._benchmark_stage_timestamp()
+        if pipeline_start is not None:
+            self.last_stage_timings["vae_decode_seconds"] = decode_end - denoise_end
+            self.last_stage_timings["pipeline_before_result_save_seconds"] = decode_end - pipeline_start
+        return images
 
     @torch.no_grad()
     def generate_ti2i(self, input_info):
         self._ensure_pipeline_modules()
+        pipeline_start = self._benchmark_stage_timestamp()
+        if pipeline_start is not None:
+            self.last_stage_timings = {}
         prompt = getattr(input_info, "prompt_enhanced", None) or getattr(input_info, "prompt", "")
         seed = getattr(input_info, "seed", None) or self.config.get("seed", 42)
         image_paths = self._split_image_paths(getattr(input_info, "image_path", None) or self.config.get("image_path"))
@@ -1583,7 +1743,9 @@ class HunyuanImage3Runner(DefaultRunner):
         image_size = self._resolve_ti2i_image_size(self._resolve_image_size(input_info), batch_cond_images)
 
         text_cond_inputs = self._prepare_cond_inputs(batch_cond_images, cfg_factor=1, seed=seed)
+        condition_encode_end = self._benchmark_stage_timestamp()
         cot_text = self._generate_cot_text(prompt, image_size, batch_cond_images=batch_cond_images, cond_inputs=text_cond_inputs)
+        ar_end = self._benchmark_stage_timestamp()
 
         # in default, we enable CFG for i2i/ti2i, but disable CFG if cfg_distilled is True
         do_cfg = bool(self.config.get("enable_cfg", False)) and not bool(self.config.get("cfg_distilled", False))
@@ -1596,15 +1758,34 @@ class HunyuanImage3Runner(DefaultRunner):
             batch_cond_images=batch_cond_images,
             cond_inputs=gen_cond_inputs,
         )
+        conditioning_end = self._benchmark_stage_timestamp()
         latents = self._denoise_latents(prepared_inputs, image_size)
+        denoise_end = self._benchmark_stage_timestamp()
+        if pipeline_start is not None:
+            ar_seconds = ar_end - condition_encode_end
+            denoise_seconds = denoise_end - conditioning_end
+            self.last_stage_timings = {
+                "condition_image_prepare_encode_seconds": condition_encode_end - pipeline_start,
+                **self._benchmark_ar_fields(ar_seconds),
+                "conditioning_prepare_seconds": conditioning_end - ar_end,
+                "denoise_seconds": denoise_seconds,
+                **getattr(self, "_last_denoise_step_metadata", {}),
+                "ar_plus_denoise_seconds": ar_seconds + denoise_seconds,
+                "ar_conditioning_denoise_seconds": denoise_end - condition_encode_end,
+            }
         if not self._is_output_rank():
             return []
         images = self._decode_latents(latents, prepared_inputs["generator"])
-        return self.hunyuan_image_processor.postprocess_outputs(
+        images = self.hunyuan_image_processor.postprocess_outputs(
             images,
             batch_cond_images=batch_cond_images,
             infer_align_image_size=infer_align_image_size,
         )
+        decode_end = self._benchmark_stage_timestamp()
+        if pipeline_start is not None:
+            self.last_stage_timings["vae_decode_postprocess_seconds"] = decode_end - denoise_end
+            self.last_stage_timings["pipeline_before_result_save_seconds"] = decode_end - pipeline_start
+        return images
 
     def generate_i2i(self, input_info):
         """Compatibility alias for the pre-TI2I task name."""
@@ -1642,7 +1823,10 @@ class HunyuanImage3Runner(DefaultRunner):
 
         save_result_path = getattr(input_info, "save_result_path", None)
         if save_result_path:
+            save_start = time.perf_counter() if self._benchmark_stage_timing_enabled() else None
             Path(save_result_path).parent.mkdir(parents=True, exist_ok=True)
             images[0].save(save_result_path)
+            if save_start is not None:
+                self.last_stage_timings["result_save_seconds"] = time.perf_counter() - save_start
             logger.info(f"HunyuanImage3 image saved successfully to: {save_result_path}")
         return {"image": None}
