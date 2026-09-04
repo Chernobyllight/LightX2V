@@ -38,6 +38,87 @@ conda activate base
 
 路径都可以通过下文列出的环境变量覆盖。
 
+### 从零构造 `openpi_data`
+
+`/data/liuhongda/openpi_data` 不是 OpenPI 仓库自带的目录，也不是官方固定路径。
+OpenPI 官方下载器默认使用 `~/.cache/openpi`，并通过 `OPENPI_DATA_HOME` 修改缓存
+根目录；LightX2V 使用 `OPENPI_DATA_ROOT` 查找同一批资源。本指南将两个变量指向
+同一个目录：
+
+```bash
+export OPENPI_DATA_HOME=/data/liuhongda/openpi_data
+export OPENPI_DATA_ROOT=/data/liuhongda/openpi_data
+```
+
+两个变量的职责不同：`OPENPI_DATA_HOME` 只影响 OpenPI 官方下载器，
+`OPENPI_DATA_ROOT` 只影响本目录下的 LightX2V 脚本。
+
+如果已经有转换完成的 PyTorch checkpoint，只做推理或评测所需的最小结构是：
+
+```text
+openpi_data/
+├── openpi-assets/checkpoints/pi05_libero_pytorch_fp32/
+│   ├── model.safetensors
+│   ├── config.json
+│   └── assets/
+│       ├── paligemma_tokenizer.model
+│       └── physical-intelligence/libero/norm_stats.json
+└── python_deps/openpi_official_pytorch_runtime/  # 由环境准备脚本生成
+```
+
+如果要从官方 JAX checkpoint 开始转换，转换前还需要：
+
+```text
+openpi_data/
+├── openpi-assets/checkpoints/pi05_libero/
+│   ├── params/                                   # 完整 Orbax checkpoint
+│   └── assets/physical-intelligence/libero/norm_stats.json
+└── big_vision/paligemma_tokenizer.model
+```
+
+在已经执行过 `uv sync` 的 OpenPI 仓库中，可以用官方 `maybe_download()` 下载这两项：
+
+```bash
+cd /data/liuhongda/openpi
+
+export OPENPI_DATA_HOME=/data/liuhongda/openpi_data
+export OPENPI_DATA_ROOT=/data/liuhongda/openpi_data
+
+uv run --no-sync python -c \
+  'from openpi.shared import download; print(download.maybe_download("gs://openpi-assets/checkpoints/pi05_libero"))'
+
+uv run --no-sync python -c \
+  'from openpi.shared import download; print(download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"}))'
+```
+
+下载器会自动创建 `openpi_data` 及其子目录，不需要手工逐级创建。
+
+下载完成后回到 LightX2V，依次生成 Transformers overlay 和 FP32 PyTorch 权重：
+
+```bash
+cd /data/liuhongda/lightx2v_openpi
+conda activate base
+
+export OPENPI_DATA_ROOT=/data/liuhongda/openpi_data
+
+bash scripts/openpi/2_setup_pytorch_runtime.sh
+bash scripts/openpi/1_convert_pi05_libero_to_pytorch.sh
+bash scripts/openpi/2_setup_pytorch_runtime.sh check
+```
+
+对应的目录生成关系是：
+
+| 操作 | 生成内容 |
+| --- | --- |
+| OpenPI `maybe_download()` | `openpi-assets/checkpoints/pi05_libero` 和 `big_vision/paligemma_tokenizer.model` |
+| `2_setup_pytorch_runtime.sh` | `python_deps/openpi_official_pytorch_runtime` |
+| `1_convert_pi05_libero_to_pytorch.sh` | `openpi-assets/checkpoints/pi05_libero_pytorch_fp32` |
+
+LIBERO 仿真环境仍位于 `/data/liuhongda/openpi/third_party/libero`，不放在
+`openpi_data` 中。`lerobot/physical-intelligence/libero` 只在微调时需要；
+`raw/`、`results/`、`manifests/`、`runtime_configs/` 和各种 cache 目录也都不是
+推理或评测的最小依赖。
+
 ## 1. 准备运行环境
 
 setup 只安装或修复 OpenPI 所需的小包：base 环境中的 `mujoco==3.2.3`，以及
@@ -390,6 +471,7 @@ coordinator 当前按完整 suite 写新目录，不提供中途恢复。
 
 | 环境变量 | 作用 |
 | --- | --- |
+| `OPENPI_DATA_HOME` | OpenPI 官方下载器的缓存根目录，仅下载阶段使用 |
 | `OPENPI_DATA_ROOT` | checkpoint、tokenizer 和 Transformers overlay 的数据根目录 |
 | `OPENPI_MODEL_PATH` | PyTorch checkpoint |
 | `OPENPI_CONFIG` | 模型 JSON |
