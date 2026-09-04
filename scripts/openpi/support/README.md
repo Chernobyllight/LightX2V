@@ -101,9 +101,9 @@ conda activate base
 
 export OPENPI_DATA_ROOT=/data/liuhongda/openpi_data
 
-bash scripts/openpi/2_setup_pytorch_runtime.sh
-bash scripts/openpi/1_convert_pi05_libero_to_pytorch.sh
-bash scripts/openpi/2_setup_pytorch_runtime.sh check
+bash scripts/openpi/1_setup_pytorch_runtime.sh
+bash scripts/openpi/2_convert_pi05_libero_to_pytorch.sh
+bash scripts/openpi/1_setup_pytorch_runtime.sh check
 ```
 
 对应的目录生成关系是：
@@ -111,8 +111,8 @@ bash scripts/openpi/2_setup_pytorch_runtime.sh check
 | 操作 | 生成内容 |
 | --- | --- |
 | OpenPI `maybe_download()` | `openpi-assets/checkpoints/pi05_libero` 和 `big_vision/paligemma_tokenizer.model` |
-| `2_setup_pytorch_runtime.sh` | `python_deps/openpi_official_pytorch_runtime` |
-| `1_convert_pi05_libero_to_pytorch.sh` | `openpi-assets/checkpoints/pi05_libero_pytorch_fp32` |
+| `1_setup_pytorch_runtime.sh` | `python_deps/openpi_official_pytorch_runtime` |
+| `2_convert_pi05_libero_to_pytorch.sh` | `openpi-assets/checkpoints/pi05_libero_pytorch_fp32` |
 
 LIBERO 仿真环境仍位于 `/data/liuhongda/openpi/third_party/libero`，不放在
 `openpi_data` 中。`lerobot/physical-intelligence/libero` 只在微调时需要；
@@ -126,13 +126,13 @@ setup 只安装或修复 OpenPI 所需的小包：base 环境中的 `mujoco==3.2
 Python、PyTorch 或 CUDA。
 
 ```bash
-bash scripts/openpi/2_setup_pytorch_runtime.sh
+bash scripts/openpi/1_setup_pytorch_runtime.sh
 ```
 
 训练或评测前可做只读检查：
 
 ```bash
-bash scripts/openpi/2_setup_pytorch_runtime.sh check
+bash scripts/openpi/1_setup_pytorch_runtime.sh check
 ```
 
 检查覆盖 checkpoint、Transformers replacement、MuJoCo 来源、LIBERO 来源和
@@ -143,17 +143,17 @@ CUDA。启动脚本不会在每次运行前重复执行这项检查。
 默认将官方 JAX checkpoint 转为 FP32 PyTorch checkpoint：
 
 ```bash
-bash scripts/openpi/1_convert_pi05_libero_to_pytorch.sh
+bash scripts/openpi/2_convert_pi05_libero_to_pytorch.sh
 ```
 
 选择输出精度或路径：
 
 ```bash
-bash scripts/openpi/1_convert_pi05_libero_to_pytorch.sh --precision bfloat16
+bash scripts/openpi/2_convert_pi05_libero_to_pytorch.sh --precision bfloat16
 
 OPENPI_JAX_CHECKPOINT=/path/to/pi05_libero \
 OPENPI_PYTORCH_CHECKPOINT=/path/to/pi05_libero_pytorch_fp32 \
-bash scripts/openpi/1_convert_pi05_libero_to_pytorch.sh --precision float32
+bash scripts/openpi/2_convert_pi05_libero_to_pytorch.sh --precision float32
 ```
 
 转换器使用 OpenPI 自身的环境，默认是

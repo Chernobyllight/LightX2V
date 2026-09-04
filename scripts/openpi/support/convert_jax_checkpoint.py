@@ -79,7 +79,7 @@ def _check_inputs(args: argparse.Namespace) -> None:
     try:
         subprocess.run([sys.executable, "-c", probe], env=_conversion_environment(args), check=True)
     except subprocess.CalledProcessError as error:
-        raise RuntimeError("the conversion Python cannot load OpenPI's patched transformers==4.53.2; run scripts/openpi/2_setup_pytorch_runtime.sh first") from error
+        raise RuntimeError("the conversion Python cannot load OpenPI's patched transformers==4.53.2; run scripts/openpi/1_setup_pytorch_runtime.sh first") from error
 
 
 def _run_converter(args: argparse.Namespace, output: Path) -> None:
