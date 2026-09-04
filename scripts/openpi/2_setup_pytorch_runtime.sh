@@ -11,4 +11,4 @@ elif [[ "${1:-}" == "setup" || "${1:-}" == "prepare" ]]; then
     shift
 fi
 
-exec python "${script_dir}/runtime.py" "${command}" "$@"
+exec python "${script_dir}/support/runtime.py" "${command}" "$@"

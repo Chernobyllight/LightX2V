@@ -105,7 +105,7 @@ worker_pids=()
 trap - EXIT HUP INT TERM
 
 summary_command=(
-  python "${script_dir}/libero_summary.py"
+  python "${script_dir}/support/libero_summary.py"
   --output-root "${output_root}"
 )
 for suite in "${suites[@]}"; do

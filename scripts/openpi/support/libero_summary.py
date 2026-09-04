@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate completed LIBERO suite summaries without launching inference."""
+"""Aggregate LIBERO suite summaries without launching inference."""
 
 from __future__ import annotations
 

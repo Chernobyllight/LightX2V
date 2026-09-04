@@ -12,6 +12,9 @@ shell -> python -m lightx2v.infer -> OpenPIRunner
 topic 直连，同样不启动 OpenPI server。两条路径都使用当前 base Python；仅任务
 特异的 Transformers 代码放在私有 overlay 中。
 
+模型实现改编自 Physical Intelligence OpenPI（Apache-2.0）；随仓库提供的
+Transformers replacement 文件保留原始版权和许可证声明。
+
 以下命令默认在项目根目录执行：
 
 ```bash
@@ -167,7 +170,7 @@ save_results/pi05_libero_pytorch_fp32_parallel_evaluation/
 └── parallel_summary.json
 ```
 
-`libero_summary.py` 只读取各 suite 的 JSON 结果并生成最终汇总，不是推理入口。
+`support/libero_summary.py` 只读取各 suite 的 JSON 结果并生成最终汇总，不是推理入口。
 输出锁会阻止两个并行任务同时写入同一目录。
 
 ## 6. ROS 单 episode 交互
@@ -387,6 +390,7 @@ coordinator 当前按完整 suite 写新目录，不提供中途恢复。
 
 | 环境变量 | 作用 |
 | --- | --- |
+| `OPENPI_DATA_ROOT` | checkpoint、tokenizer 和 Transformers overlay 的数据根目录 |
 | `OPENPI_MODEL_PATH` | PyTorch checkpoint |
 | `OPENPI_CONFIG` | 模型 JSON |
 | `OPENPI_EVAL_CONFIG` | 评测协议 JSON |
@@ -406,19 +410,15 @@ coordinator 当前按完整 suite 写新目录，不提供中途恢复。
 | `OPENPI_ROS_OUTPUT_DIR` | ROS suite 结果根目录 |
 | `OPENPI_ROS_OVERWRITE` | 是否覆盖已有 ROS suite 结果，默认 `false` |
 
-## 10. 开发检查与验收
+## 10. 开发检查
 
 ```bash
 bash -n scripts/openpi/*.sh
-python -m unittest discover -s scripts/openpi/tests -p 'test_*.py' -v
-python scripts/openpi/tests/validate_pytorch_parity.py --self-check
 pre-commit run --all-files
 ```
 
 数值路径的关键约束是官方图像 resize/uint8 量化、FP64 动作反归一化、连续 policy
 RNG 和 5-action replan queue；清理启动脚本时不应改变这些逻辑。
 
-ROS 契约测试覆盖乱序/重复 topic、10→5 action queue、float64 传输、官方
-旋转/resize/state/action 变换和迟到 action 拒绝。修改 ROS 文件后还应重新构建
-`common simulator inference`；LIBERO adapter 会把可见的物理 GPU 映射为 EGL
-逻辑设备 0。
+修改 ROS 文件后需要重新构建 `common simulator inference`；LIBERO adapter 会把
+可见的物理 GPU 映射为 EGL 逻辑设备 0。

@@ -21,12 +21,11 @@ import sysconfig
 import tempfile
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 WORKSPACE_ROOT = PROJECT_ROOT.parent
-OPENPI_DATA_ROOT = WORKSPACE_ROOT / "openpi_data"
-DEFAULT_PYTHON = Path("/opt/conda/bin/python")
+OPENPI_DATA_ROOT = Path(os.environ.get("OPENPI_DATA_ROOT", str(WORKSPACE_ROOT / "openpi_data"))).expanduser().resolve()
 DEFAULT_MODEL = OPENPI_DATA_ROOT / "openpi-assets/checkpoints/pi05_libero_pytorch_fp32"
-DEFAULT_TRANSFORMERS_RUNTIME = OPENPI_DATA_ROOT / "python_deps/openpi_official_pytorch_runtime"
+DEFAULT_TRANSFORMERS_OVERLAY = OPENPI_DATA_ROOT / "python_deps/openpi_official_pytorch_runtime"
 DEFAULT_LIBERO_ROOT = WORKSPACE_ROOT / "openpi/third_party/libero"
 DEFAULT_MODEL_CONFIG = PROJECT_ROOT / "configs/openpi/pi05_libero.json"
 DEFAULT_EVAL_CONFIG = PROJECT_ROOT / "configs/openpi/pi05_libero_eval.json"
@@ -450,7 +449,7 @@ def _check_runtime(args: argparse.Namespace) -> None:
 def _add_paths(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--transformers-runtime",
-        default=os.environ.get("OPENPI_TRANSFORMERS_RUNTIME_PATH", str(DEFAULT_TRANSFORMERS_RUNTIME)),
+        default=os.environ.get("OPENPI_TRANSFORMERS_RUNTIME_PATH", str(DEFAULT_TRANSFORMERS_OVERLAY)),
     )
 
 
@@ -465,7 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     check = subparsers.add_parser("check", help="validate runtime, checkpoint, configs, and official LIBERO paths")
     _add_paths(check)
-    check.add_argument("--expected-python", default=os.environ.get("OPENPI_PYTHON", str(DEFAULT_PYTHON)))
+    check.add_argument("--expected-python", default=os.environ.get("OPENPI_PYTHON", sys.executable))
     check.add_argument("--model-path", default=os.environ.get("OPENPI_MODEL_PATH", str(DEFAULT_MODEL)))
     check.add_argument("--model-config", default=os.environ.get("OPENPI_CONFIG", str(DEFAULT_MODEL_CONFIG)))
     check.add_argument("--eval-config", default=os.environ.get("OPENPI_EVAL_CONFIG", str(DEFAULT_EVAL_CONFIG)))

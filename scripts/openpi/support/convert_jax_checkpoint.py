@@ -16,13 +16,13 @@ from pathlib import Path
 
 from safetensors import safe_open
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 WORKSPACE_ROOT = PROJECT_ROOT.parent
-OPENPI_DATA_ROOT = WORKSPACE_ROOT / "openpi_data"
+OPENPI_DATA_ROOT = Path(os.environ.get("OPENPI_DATA_ROOT", str(WORKSPACE_ROOT / "openpi_data"))).expanduser().resolve()
 DEFAULT_OPENPI_ROOT = WORKSPACE_ROOT / "openpi"
 DEFAULT_SOURCE = OPENPI_DATA_ROOT / "openpi-assets/checkpoints/pi05_libero"
 DEFAULT_TOKENIZER = OPENPI_DATA_ROOT / "big_vision/paligemma_tokenizer.model"
-DEFAULT_TRANSFORMERS_RUNTIME = OPENPI_DATA_ROOT / "python_deps/openpi_official_pytorch_runtime"
+DEFAULT_TRANSFORMERS_OVERLAY = OPENPI_DATA_ROOT / "python_deps/openpi_official_pytorch_runtime"
 
 EXPECTED_TENSORS = 812
 DTYPE_BY_PRECISION = {"float32": "F32", "bfloat16": "BF16"}
@@ -155,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer", default=os.environ.get("OPENPI_TOKENIZER_PATH", str(DEFAULT_TOKENIZER)))
     parser.add_argument(
         "--transformers-runtime",
-        default=os.environ.get("OPENPI_TRANSFORMERS_RUNTIME_PATH", str(DEFAULT_TRANSFORMERS_RUNTIME)),
+        default=os.environ.get("OPENPI_TRANSFORMERS_RUNTIME_PATH", str(DEFAULT_TRANSFORMERS_OVERLAY)),
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser
