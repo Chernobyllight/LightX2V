@@ -1,7 +1,11 @@
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from loguru import logger
 
+from lightx2v.common.offload.shared_weight_coordinator import coordinate_rank_local_error
 from lightx2v.models.networks.base_model import BaseTransformerModel
 from lightx2v.models.networks.wan.infer.feature_caching.transformer_infer import (
     WanTransformerInferAdaCaching,
@@ -20,6 +24,9 @@ from lightx2v.models.networks.wan.infer.post_infer import WanPostInfer
 from lightx2v.models.networks.wan.infer.pre_infer import WanPreInfer
 from lightx2v.models.networks.wan.infer.transformer_infer import (
     WanTransformerInfer,
+)
+from lightx2v.models.networks.wan.shared_block_weights import (
+    WanFp8VllmSharedBlockAdapter,
 )
 from lightx2v.models.networks.wan.weights.pre_weights import WanPreWeights
 from lightx2v.models.networks.wan.weights.transformer_weights import (
@@ -51,6 +58,79 @@ class WanModel(BaseTransformerModel):
         self._init_infer_class()
         self._init_weights()
         self._init_infer()
+
+    def _load_shared_cpu_weights(self, unified_dtype, sensitive_layer):
+        """Load rank-private non-block tensors plus NUMA-shared DiT blocks."""
+        local_error = None
+        try:
+            adapter = WanFp8VllmSharedBlockAdapter(self.config, lora_path=self.lora_path)
+            non_block_path = os.path.join(self.config["dit_quantized_ckpt"], "non_block.safetensors")
+            if not os.path.isfile(non_block_path):
+                raise FileNotFoundError(f"Wan non-block checkpoint not found: {non_block_path}")
+            logger.info(f"[SharedCPUWeightsInfo] Loading rank-private Wan non-block weights from {non_block_path}")
+            private_weights = self._load_safetensor_to_dict(non_block_path, unified_dtype, sensitive_layer)
+        except Exception as error:
+            local_error = error
+
+        # Every rank completes local checkpoint I/O before entering the arena
+        # collectives, so one bad file cannot strand healthy peers.
+        coordinate_rank_local_error("Wan checkpoint preflight", local_error)
+
+        allocation = adapter.materialize()
+        try:
+            weight_map = adapter.build_weight_map(private_weights)
+        except BaseException:
+            try:
+                allocation.close()
+            except Exception as cleanup_error:
+                logger.error(f"Failed to close Wan shared CPU weight arena after initialization error: {cleanup_error}")
+            raise
+        self._pending_shared_weight_map = weight_map
+        return weight_map
+
+    def _validate_shared_cpu_weights(self):
+        """Prove that every block leaf adopted a registered arena view."""
+        weight_map = self._pending_shared_weight_map
+        allocation = weight_map.owner
+        manifest = allocation.arena.manifest
+        expected = set(manifest.by_name)
+        consumed = set(weight_map.consumed_shared_keys)
+        if consumed != expected:
+            missing = sorted(expected - consumed)
+            unexpected = sorted(consumed - expected)
+            raise RuntimeError(
+                "Wan block modules did not consume the complete shared manifest "
+                f"(missing={len(missing)} {missing[:8]}, unexpected={len(unexpected)} {unexpected[:8]})"
+            )
+
+        block_state = self.transformer_weights.blocks.state_dict()
+        actual = set(block_state)
+        if not expected.issubset(actual):
+            missing = sorted(expected - actual)
+            raise RuntimeError(f"Wan block state is missing {len(missing)} shared manifest tensors: {missing[:8]}")
+
+        arena = allocation.arena
+        wrong_pointer = []
+        wrong_dtype = []
+        unpinned = []
+        for name, spec in manifest.by_name.items():
+            tensor = block_state[name]
+            expected_pointer = arena.address + spec.offset + spec.storage_offset * spec.itemsize
+            if tensor.data_ptr() != expected_pointer:
+                wrong_pointer.append(name)
+            if str(tensor.dtype).removeprefix("torch.") != spec.dtype:
+                wrong_dtype.append(name)
+            if not tensor.is_pinned():
+                unpinned.append(name)
+        if wrong_pointer or wrong_dtype or unpinned:
+            raise RuntimeError(
+                "Wan shared block validation found copied or unregistered tensors "
+                f"(wrong_pointer={len(wrong_pointer)} {wrong_pointer[:8]}, "
+                f"wrong_dtype={len(wrong_dtype)} {wrong_dtype[:8]}, unpinned={len(unpinned)} {unpinned[:8]})"
+            )
+
+        logger.info(f"[SharedCPUWeightsInfo] Validated {len(expected)} Wan block tensor views in {arena.nbytes / 1024**3:.3f} GiB arena")
+        del self._pending_shared_weight_map
 
     # ------------------------------------------------------------------ TP --
     def _rank_device(self):
