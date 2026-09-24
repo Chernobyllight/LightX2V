@@ -10,6 +10,7 @@ from lightx2v.common.offload.shared_weight_map import consume_weight
 from lightx2v.utils.envs import *
 from lightx2v.utils.registry_factory import TENSOR_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
+from lightx2v_platform.ops.weight_storage import StorageDescription, WeightStorage
 
 
 @TENSOR_REGISTER("Default")
@@ -23,6 +24,10 @@ class DefaultTensor:
         self.create_cpu_buffer = create_cpu_buffer
         self.infer_dtype = GET_DTYPE()
         self.sensitive_layer_dtype = GET_SENSITIVE_DTYPE()
+
+    def describe_storage(self, metadata):
+        source = metadata[self.tensor_name]
+        return StorageDescription((WeightStorage(self.tensor_name, "tensor", source.shape, source.loaded_dtype or source.dtype),))
 
     def load(self, weight_dict):
         if isinstance(weight_dict, BlockLoadContext):

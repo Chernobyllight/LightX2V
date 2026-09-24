@@ -5,6 +5,17 @@ class WeightModule:
     def __init__(self):
         self._modules = {}
         self._parameters = {}
+        self._offload_groups = {}
+
+    def register_offload_group(self, name, blocks, device_slots, checkpoint_prefixes):
+        from lightx2v.common.offload.block_loader import OffloadGroup
+
+        if name in self._offload_groups:
+            raise ValueError(f"Duplicate offload group: {name}")
+        self._offload_groups[name] = OffloadGroup(blocks, device_slots, tuple(checkpoint_prefixes))
+
+    def iter_offload_groups(self):
+        return iter(self._offload_groups.values())
 
     def is_empty(self):
         return len(self._modules) == 0 and len(self._parameters) == 0
@@ -18,6 +29,9 @@ class WeightModule:
         setattr(self, name, param)
 
     def load(self, weight_dict):
+        plan = getattr(self, "_block_load_plan", None)
+        if plan is not None:
+            return plan.load(self, weight_dict)
         for _, module in self._modules.items():
             if hasattr(module, "load"):
                 module.load(weight_dict)

@@ -16,6 +16,7 @@
   "offload_granularity": "block",
   "cpu_offload_layout": "contiguous",
   "t5_cpu_offload": true,
+  "t5_rms_norm_type": "torch",
   "vae_cpu_offload": true,
   "clip_cpu_offload": true
 }

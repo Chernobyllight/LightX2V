@@ -1,6 +1,7 @@
 import torch
 
 from lightx2v_platform.ops.mm.template import MMWeightQuantTemplate
+from lightx2v_platform.ops.weight_storage import StorageDescription, WeightStorage, require_dtype
 from lightx2v_platform.registry_factory import PLATFORM_MM_WEIGHT_REGISTER
 
 try:
@@ -41,23 +42,28 @@ class MMWeightWint8channelAint8channeldynamicNpu(MMWeightQuantTemplate):
             self.base_attrs.append((self.bias_name, "bias", False))
 
     def load(self, weight_dict):
-        from lightx2v.common.offload.block_layout import BlockLoadContext
-
-        if isinstance(weight_dict, BlockLoadContext):
-            weight_dict.bind(self)
-            if self.bias_name is None:
-                self.bias = None
-            return
         if not self.lazy_load and weight_dict[self.weight_name].dtype != torch.int8:
             raise ValueError(f"int8-npu requires an INT8 checkpoint: {self.weight_name}")
         super().load(weight_dict)
 
-    def contiguous_dtype(self, attr, dtype):
-        if attr == "weight" and dtype != torch.int8:
-            raise ValueError(f"int8-npu requires an INT8 checkpoint: {self.weight_name}")
-        if attr == "weight_scale" or (attr == "bias" and self.bias_force_fp32):
-            return torch.float32
-        return dtype
+    def validate_checkpoint(self, metadata):
+        require_dtype(self.weight_name, metadata[self.weight_name].dtype, (torch.int8,))
+
+    def describe_storage(self, metadata):
+        self.validate_checkpoint(metadata)
+        tensors = []
+        for name, attr, transpose in self.base_attrs:
+            source = metadata[name]
+            dtype = source.loaded_dtype or source.dtype
+            if attr == "weight_scale" or (attr == "bias" and self.bias_force_fp32):
+                dtype = torch.float32
+            tensors.append(WeightStorage(name, attr, source.shape, dtype, transpose))
+        return StorageDescription(tuple(tensors))
+
+    def bind_storage(self, context):
+        context.bind(self)
+        if self.bias_name is None:
+            self.bias = None
 
     def act_quant_int8_perchannel_sym_npu(self, x):
         input_tensor_quant, input_tensor_scale = torch_npu.npu_dynamic_quant(x)
