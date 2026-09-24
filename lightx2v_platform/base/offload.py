@@ -29,9 +29,16 @@ class TorchBlockOffload:
         return getattr(torch, device.type)
 
 
+# Key by platform identity, not the torch device type shared by other vendors.
+_DEFAULT_BLOCK_OFFLOAD_BACKENDS = {"cuda": TorchBlockOffload}
+
+
 def get_block_offload_backend(required=True):
-    platform = PLATFORM_DEVICE_REGISTER[global_var.PLATFORM]
+    platform_name = global_var.PLATFORM
+    platform = PLATFORM_DEVICE_REGISTER[platform_name]
     backend = getattr(platform, "block_offload_backend", None)
+    if backend is None:
+        backend = _DEFAULT_BLOCK_OFFLOAD_BACKENDS.get(platform_name)
     if backend is None and required:
-        raise ValueError(f"Platform {global_var.PLATFORM!r} has not declared contiguous block offload support")
+        raise ValueError(f"Platform {platform_name!r} has not declared contiguous block offload support")
     return backend

@@ -1,7 +1,6 @@
 import torch
 import torch.distributed as dist
 
-from lightx2v_platform.base.offload import TorchBlockOffload
 from lightx2v_platform.registry_factory import PLATFORM_DEVICE_REGISTER
 
 try:
@@ -13,7 +12,6 @@ except ImportError:
 @PLATFORM_DEVICE_REGISTER("cuda")
 class CudaDevice:
     name = "cuda"
-    block_offload_backend = TorchBlockOffload
 
     @staticmethod
     def init_device_env():

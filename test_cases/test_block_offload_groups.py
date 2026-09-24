@@ -228,6 +228,41 @@ def test_checkpoint_reader_keeps_original_dtype_before_casting(tmp_path, extensi
     assert model._checkpoint_metadata[name].shape == (32, 32)
 
 
+def test_cuda_and_npu_select_their_own_offload_backend(monkeypatch):
+    from lightx2v_platform.base import global_var
+    from lightx2v_platform.base.ascend_npu import NpuBlockOffload
+    from lightx2v_platform.base.offload import TorchBlockOffload, get_block_offload_backend
+
+    for platform_name, expected in (("cuda", TorchBlockOffload), ("ascend_npu", NpuBlockOffload)):
+        monkeypatch.setattr(global_var, "PLATFORM", platform_name)
+        assert get_block_offload_backend() is expected
+        assert get_block_offload_backend(required=False) is expected
+
+
+def test_explicit_offload_backend_overrides_cuda_default(monkeypatch):
+    from lightx2v_platform.base import global_var
+    from lightx2v_platform.base.nvidia import CudaDevice
+    from lightx2v_platform.base.offload import TorchBlockOffload, get_block_offload_backend
+
+    class CustomBlockOffload(TorchBlockOffload):
+        pass
+
+    monkeypatch.setattr(global_var, "PLATFORM", "cuda")
+    monkeypatch.setattr(CudaDevice, "block_offload_backend", CustomBlockOffload, raising=False)
+    assert get_block_offload_backend() is CustomBlockOffload
+
+
+@pytest.mark.parametrize("platform_name", ["metax_cuda", "ppu_cuda", "musa", "hygon_dcu"])
+def test_other_platforms_do_not_inherit_cuda_offload_support(monkeypatch, platform_name):
+    from lightx2v_platform.base import global_var
+    from lightx2v_platform.base.offload import get_block_offload_backend
+
+    monkeypatch.setattr(global_var, "PLATFORM", platform_name)
+    assert get_block_offload_backend(required=False) is None
+    with pytest.raises(ValueError, match=f"Platform {platform_name!r} has not declared"):
+        get_block_offload_backend()
+
+
 def test_npu_format_setup_and_strided_host_copy(monkeypatch):
     from lightx2v_platform.base.ascend_npu import NpuBlockOffload, NpuDevice
 
